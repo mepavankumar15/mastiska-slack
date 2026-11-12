@@ -8,8 +8,13 @@ const SLACK_APP_TOKEN  = process.env.SLACK_APP_TOKEN!;
 const GROQ_API_KEY     = process.env.GROQ_API_KEY!;
 const GITHUB_TOKEN     = process.env.GITHUB_TOKEN!;
 const GITHUB_OWNER     = process.env.GITHUB_OWNER!;
-const GITHUB_VAULT     = process.env.GITHUB_VAULT_REPO || "arthavid-vault";
+const GITHUB_VAULT     = process.env.GITHUB_VAULT_REPO || "angadha-vault";
 const MODEL            = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+
+// Daily todo check-ins (optional). OWNER_SLACK_ID = your Slack member ID (Profile → ⋮ → Copy member ID)
+const OWNER_SLACK_ID   = process.env.OWNER_SLACK_ID;           // enables the scheduled DMs
+const EVENING_TIME     = process.env.EVENING_TIME || "21:00";   // IST, "how many tasks did you finish?"
+const MORNING_TIME     = process.env.MORNING_TIME;              // IST, optional morning push (e.g. "07:30")
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !GROQ_API_KEY) {
   console.error("❌ Missing required env vars. Check .env file.");
@@ -26,8 +31,8 @@ const app = new App({
 });
 
 // ── IST date/time helpers ─────────────────────────────────────────
-function istDate(): string {
-  return new Date(Date.now() + 5.5 * 3600000).toISOString().split("T")[0];
+function istDate(offsetDays = 0): string {
+  return new Date(Date.now() + 5.5 * 3600000 + offsetDays * 86400000).toISOString().split("T")[0];
 }
 function istTime(): string {
   return new Date(Date.now() + 5.5 * 3600000).toISOString().split("T")[1].substring(0, 5);
@@ -41,6 +46,9 @@ function istTime(): string {
 //   Ideas/project-ideas.md
 //   HackerNews/YYYY-MM-DD.md
 //   Notes/YYYY-MM-DD.md
+//   Todos/YYYY-MM-DD.md — daily task checklist + result line
+
+const SAVE_FAILED = "⚠️ Couldn't write to your vault (GitHub rejected it — check GITHUB_TOKEN / repo name / rate limit). Nothing was saved.";
 
 async function vaultRead(path: string): Promise<{ content: string; sha: string } | null> {
   if (!GITHUB_TOKEN) return null;
@@ -72,12 +80,18 @@ async function vaultWrite(path: string, newLines: string, append = true): Promis
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      message: `ArthaVid: update ${path}`,
+      message: `Mastiska: update ${path}`,
       content: Buffer.from(body).toString("base64"),
       sha: existing?.sha,
     }),
   });
   return res.ok;
+}
+
+// Append an entry to a file, creating it with a header if it doesn't exist yet.
+async function appendEntry(path: string, header: string, entry: string): Promise<boolean> {
+  const existing = await vaultRead(path);
+  return vaultWrite(path, existing ? entry : header + entry, !!existing);
 }
 
 // ── Groq ──────────────────────────────────────────────────────────
@@ -103,11 +117,25 @@ const TOPIC_TO_HN: Record<string, string> = {
   sector: "sector analysis industry", economy: "economy GDP inflation india",
 };
 
-async function fetchHN(query: string, limit = 5): Promise<HNStory[]> {
-  const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=${limit}&numericFilters=points>30`;
+async function fetchHN(query: string, limit = 5, minPoints = 30, days = 0): Promise<HNStory[]> {
+  const filters = [`points>${minPoints}`];
+  if (days) filters.push(`created_at_i>${Math.floor(Date.now() / 1000) - days * 86400}`);
+  const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(query)}&tags=story&hitsPerPage=${limit}&numericFilters=${filters.join(",")}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HN API ${res.status}`);
   return ((await res.json()) as any).hits ?? [];
+}
+
+// HN-only topics: `#hn #seed`. Add more here later (e.g. launch, layoffs, acquisition).
+const HN_EXTRA: Record<string, { label: string; queries: string[]; minPoints: number; days: number }> = {
+  seed: { label: "startups raising seed rounds (last 90 days)", queries: ["raises seed", "seed round"], minPoints: 5, days: 90 },
+};
+
+async function fetchHNExtra(cfg: { queries: string[]; minPoints: number; days: number }, limit = 6): Promise<HNStory[]> {
+  const results = await Promise.all(cfg.queries.map(q => fetchHN(q, 10, cfg.minPoints, cfg.days)));
+  const seen = new Map<string, HNStory>();
+  results.flat().forEach(s => seen.set(s.objectID, s));
+  return [...seen.values()].sort((a, b) => b.points - a.points).slice(0, limit);
 }
 
 function timeAgo(d: string): string {
@@ -129,7 +157,7 @@ function formatHN(stories: HNStory[], label: string): string {
   return lines.join("\n");
 }
 
-// ── Content generation (ArthaVid core) ───────────────────────────
+// ── Content generation (Mastiska core) ───────────────────────────
 const TOPIC_TAGS: Record<string, string> = {
   ipo:         "This is about an IPO. Cover: company background, IPO price, GMP if known, bull case, bear case.",
   earnings:    "This is about company earnings/results. Cover: revenue, profit, vs estimates, stock reaction.",
@@ -205,7 +233,7 @@ function parseTags(msg: string) {
 }
 
 function buildContentPrompt(parsed: ReturnType<typeof parseTags>): string {
-  const parts = ["You are ArthaVid, an AI fintech content assistant for a student content creator.\n"];
+  const parts = ["You are Mastiska, an AI fintech content assistant for a student content creator.\n"];
   if (parsed.topicTags.length) {
     parts.push("TOPIC CONTEXT:");
     parsed.topicTags.forEach(t => parts.push(`• ${TOPIC_TAGS[t]}`));
@@ -222,11 +250,57 @@ function buildContentPrompt(parsed: ReturnType<typeof parseTags>): string {
   return parts.join("\n");
 }
 
+// ── Todos (Todos/YYYY-MM-DD.md, markdown checkboxes) ─────────────
+type Task = { done: boolean; text: string };
+const TASK_LINE = /^- \[( |x)\] (.+)$/i;
+
+function parseTasks(content: string): Task[] {
+  const out: Task[] = [];
+  for (const line of content.split("\n")) {
+    const m = line.match(TASK_LINE);
+    if (m) out.push({ done: m[1].toLowerCase() === "x", text: m[2] });
+  }
+  return out;
+}
+
+function formatTasks(tasks: Task[]): string {
+  return tasks.map((t, i) => `${t.done ? "✅" : "⬜"} ${i + 1}. ${t.text}`).join("\n");
+}
+
+async function loadTasks(date: string): Promise<Task[]> {
+  const f = await vaultRead(`Todos/${date}.md`);
+  return f ? parseTasks(f.content) : [];
+}
+
+// Marks tasks done (by 1-based number), "all", or "none" (reset). Writes a Result line.
+async function markDone(date: string, which: number[] | "all" | "none") {
+  const f = await vaultRead(`Todos/${date}.md`);
+  if (!f) return null;
+  let n = 0;
+  const lines = f.content
+    .split("\n")
+    .filter(l => !l.startsWith("**Result:**"))
+    .map(l => {
+      const m = l.match(TASK_LINE);
+      if (!m) return l;
+      n++;
+      const wasDone = m[1].toLowerCase() === "x";
+      const done = which === "all" ? true : which === "none" ? false : wasDone || which.includes(n);
+      return `- [${done ? "x" : " "}] ${m[2]}`;
+    });
+  const tasks = parseTasks(lines.join("\n"));
+  if (!tasks.length) return null;
+  const done = tasks.filter(t => t.done).length;
+  const body = lines.join("\n").trimEnd() + `\n\n**Result:** ${done}/${tasks.length} done (${Math.round((done / tasks.length) * 100)}%)`;
+  const ok = await vaultWrite(`Todos/${date}.md`, body, false);
+  return { ok, done, total: tasks.length, tasks };
+}
+
 // ── Last response store (for #save) ──────────────────────────────
 const lastAIResponse = new Map<string, string>(); // channelId → last response
 
 // ── Help message ──────────────────────────────────────────────────
-const HELP = `👋 *ArthaVid — Your AI Second Brain*
+const HELP = `👋 *Mastiska — Your AI Second Brain*
 
 *📝 Quick Log*
 \`#note [text]\` → saves to Notes
@@ -239,8 +313,16 @@ const HELP = `👋 *ArthaVid — Your AI Second Brain*
 \`#gym #weight [kg]\` → logs body weight
 \`#gym summary\` → shows this week
 
+*✅ Todos*
+\`#todo task one; task two\` → plan tomorrow's tasks
+\`#todo #today task\` → add to today's list
+\`#tasks\` → today's tasks (\`#tasks #tomorrow\` for tomorrow)
+\`#done 1 3\` → mark tasks 1 and 3 done (\`#done all\` / \`#done none\`)
+_Evening check-in DM asks how many you finished._
+
 *📰 Hacker News*
 \`#hn\` → top fintech stories right now
+\`#hn #seed\` → startups raising seed rounds (last 90 days)
 \`#hn #crypto\` → top crypto stories
 \`#hn #startup #thread\` → content from top HN story
 
@@ -278,16 +360,56 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
     return;
   }
 
+  // ── #todo — plan tasks (default: tomorrow; add #today for today) ──
+  if (tags.includes("todo")) {
+    const content = clean.replace(/#\w+/g, "").trim();
+    const forToday = tags.includes("today");
+    const date = istDate(forToday ? 0 : 1);
+    const items = content.split(/\n|;/).map(s => s.trim()).filter(Boolean);
+    if (!items.length) { await say("What are the tasks? Try `#todo gym; finish report; call mom` (use `#todo #today ...` for today)"); return; }
+    const ok = await appendEntry(`Todos/${date}.md`, `# Tasks — ${date}\n\n`, items.map(t => `- [ ] ${t}`).join("\n"));
+    if (!ok) { await say(SAVE_FAILED); return; }
+    const tasks = await loadTasks(date);
+    await say(`📝 Added to *${forToday ? "today" : "tomorrow"}'s* list (${date}):\n\n${formatTasks(tasks)}`);
+    return;
+  }
+
+  // ── #done — mark today's tasks ───────────────────────────────────
+  if (tags.includes("done")) {
+    const arg = clean.replace(/#\w+/g, "").trim().toLowerCase();
+    let which: number[] | "all" | "none";
+    if (arg === "all") which = "all";
+    else if (arg === "none" || arg === "0") which = "none";
+    else {
+      which = (arg.match(/\d+/g) ?? []).map(Number);
+      if (!which.length) { await say("Which tasks? Reply with task numbers: `#done 1 3`, or `#done all` / `#done none`"); return; }
+    }
+    const res = await markDone(istDate(), which);
+    if (!res) { await say("No tasks found for today. Add some with `#todo #today task one; task two`"); return; }
+    if (!res.ok) { await say(SAVE_FAILED); return; }
+    const left = res.total - res.done;
+    await say(`📊 *${res.done}/${res.total} done today*\n\n${formatTasks(res.tasks)}\n\n${left ? `${left} left — plan tomorrow with \`#todo ...\`` : "🎉 Clean sweep! Plan tomorrow with `#todo ...`"}`);
+    return;
+  }
+
+  // ── #tasks / #today / #tomorrow — show list ──────────────────────
+  if (tags.some(t => ["tasks", "today", "tomorrow"].includes(t)) || /\b(today'?s|tomorrow'?s)\s+(tasks?|todos?)\b/i.test(clean)) {
+    const tomorrow = tags.includes("tomorrow") || /tomorrow'?s/i.test(clean);
+    const date = istDate(tomorrow ? 1 : 0);
+    const tasks = await loadTasks(date);
+    await say(tasks.length
+      ? `📋 *${tomorrow ? "Tomorrow" : "Today"}'s tasks* (${date})\n\n${formatTasks(tasks)}`
+      : `No tasks for ${tomorrow ? "tomorrow" : "today"} yet. Add some: \`#todo ${tomorrow ? "" : "#today "}task one; task two\``);
+    return;
+  }
+
   // ── #note ────────────────────────────────────────────────────────
   if (tags.includes("note")) {
     const content = clean.replace(/#\w+/g, "").trim();
     if (!content) { await say("What do you want to note? Try `#note [your text]`"); return; }
     const date = istDate();
-    const entry = `\n### ${istTime()}\n${content}`;
-    const header = `# Daily Notes — ${date}\n`;
-    const existing = await vaultRead(`Notes/${date}.md`);
-    await vaultWrite(`Notes/${date}.md`, existing ? entry : header + entry, !!existing);
-    await say(`✅ Note saved to *Notes/${date}.md*`);
+    const ok = await appendEntry(`Notes/${date}.md`, `# Daily Notes — ${date}\n`, `\n### ${istTime()}\n${content}`);
+    await say(ok ? `✅ Note saved to *Notes/${date}.md*` : SAVE_FAILED);
     return;
   }
 
@@ -297,20 +419,14 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
     const date = istDate();
 
     if (tags.includes("pr")) {
-      const entry = `- **PR** | ${istTime()} | ${content}`;
-      const header = `# Gym Progress\n\n## Personal Records\n`;
-      const existing = await vaultRead("Gym/progress.md");
-      await vaultWrite("Gym/progress.md", existing ? entry : header + entry, !!existing);
-      await say(`🏆 PR logged to *Gym/progress.md* → ${content}`);
+      const ok = await appendEntry("Gym/progress.md", `# Gym Progress\n\n## Personal Records\n`, `- **PR** | ${istTime()} | ${content}`);
+      await say(ok ? `🏆 PR logged to *Gym/progress.md* → ${content}` : SAVE_FAILED);
       return;
     }
 
     if (tags.includes("weight")) {
-      const entry = `- **Weight** | ${date} | ${content}`;
-      const header = `# Gym Progress\n\n## Body Weight Log\n`;
-      const existing = await vaultRead("Gym/progress.md");
-      await vaultWrite("Gym/progress.md", existing ? entry : header + entry, !!existing);
-      await say(`⚖️ Weight logged → ${content}`);
+      const ok = await appendEntry("Gym/progress.md", `# Gym Progress\n\n## Body Weight Log\n`, `- **Weight** | ${date} | ${content}`);
+      await say(ok ? `⚖️ Weight logged → ${content}` : SAVE_FAILED);
       return;
     }
 
@@ -326,11 +442,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
     }
 
     // Regular workout log
-    const entry = `\n### ${istTime()}\n${content || "Workout logged"}`;
-    const header = `# Workout — ${date}\n`;
-    const existing = await vaultRead(`Gym/${date}.md`);
-    await vaultWrite(`Gym/${date}.md`, existing ? entry : header + entry, !!existing);
-    await say(`💪 Workout logged to *Gym/${date}.md*`);
+    const ok = await appendEntry(`Gym/${date}.md`, `# Workout — ${date}\n`, `\n### ${istTime()}\n${content || "Workout logged"}`);
+    await say(ok ? `💪 Workout logged to *Gym/${date}.md*` : SAVE_FAILED);
     return;
   }
 
@@ -338,11 +451,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   if (tags.includes("idea")) {
     const content = clean.replace(/#\w+/g, "").trim();
     if (!content) { await say("What's the idea? Try `#idea [your idea]`"); return; }
-    const entry = `- [ ] ${content}  _(${istDate()} ${istTime()})_`;
-    const header = `# Content Ideas\n\n`;
-    const existing = await vaultRead("Ideas/content-ideas.md");
-    await vaultWrite("Ideas/content-ideas.md", existing ? entry : header + entry, !!existing);
-    await say(`💡 Idea saved to *Ideas/content-ideas.md*`);
+    const ok = await appendEntry("Ideas/content-ideas.md", `# Content Ideas\n\n`, `- [ ] ${content}  _(${istDate()} ${istTime()})_`);
+    await say(ok ? `💡 Idea saved to *Ideas/content-ideas.md*` : SAVE_FAILED);
     return;
   }
 
@@ -350,11 +460,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   if (tags.includes("project")) {
     const content = clean.replace(/#\w+/g, "").trim();
     if (!content) { await say("What's the project idea? Try `#project [your idea]`"); return; }
-    const entry = `- [ ] ${content}  _(${istDate()} ${istTime()})_`;
-    const header = `# Project Ideas\n\n`;
-    const existing = await vaultRead("Ideas/project-ideas.md");
-    await vaultWrite("Ideas/project-ideas.md", existing ? entry : header + entry, !!existing);
-    await say(`🚀 Project idea saved to *Ideas/project-ideas.md*`);
+    const ok = await appendEntry("Ideas/project-ideas.md", `# Project Ideas\n\n`, `- [ ] ${content}  _(${istDate()} ${istTime()})_`);
+    await say(ok ? `🚀 Project idea saved to *Ideas/project-ideas.md*` : SAVE_FAILED);
     return;
   }
 
@@ -362,13 +469,14 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   if (tags.includes("hn")) {
     const parsed = parseTags(clean);
     const topicTag = parsed.topicTags[0];
-    const label = topicTag ? `#${topicTag}` : "fintech";
+    const extra = Object.keys(HN_EXTRA).map(k => (tags.includes(k) ? HN_EXTRA[k] : null)).find(Boolean);
+    const label = extra ? extra.label : topicTag ? `#${topicTag}` : "fintech";
     const query = topicTag ? TOPIC_TO_HN[topicTag] : "fintech startup technology india";
 
     await say("🔍 Fetching from Hacker News...");
 
     try {
-      const stories = await fetchHN(query);
+      const stories = extra ? await fetchHNExtra(extra) : await fetchHN(query);
       const storiesMsg = formatHN(stories, label);
 
       // If #save included, write to vault
@@ -422,12 +530,12 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
 
 // ── Slack event listeners ─────────────────────────────────────────
 
-// Mentioned in a channel: @arthavid #nifty #thread ...
+// Mentioned in a channel: @HermesOG #nifty #thread ...
 app.event("app_mention", async ({ event, say }) => {
   try {
     await handleMessage(event.text, event.channel, say);
   } catch (err) {
-    console.error("[ArthaVid] Error:", err);
+    console.error("[mastiska] Error:", err);
   }
 });
 
@@ -438,21 +546,68 @@ app.message(async ({ message, say }) => {
   try {
     await handleMessage(msg.text ?? "", msg.channel, say);
   } catch (err) {
-    console.error("[Mastiska] DM error:", err);
+    console.error("[mastiska] DM error:", err);
   }
 });
 
-// ── Health check server (cloud hosts like Koyeb expect an open port) ──
+// ── Scheduled DMs (evening check-in, optional morning list) ───────
+const firedSlots = new Set<string>();
+const toMin = (hhmm: string) => { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; };
+
+async function dmOwner(text: string) {
+  await app.client.chat.postMessage({ channel: OWNER_SLACK_ID!, text });
+}
+
+async function runScheduler() {
+  const date = istDate();
+  const now = toMin(istTime());
+  // Due if within 2 hours after the target time and not yet sent today (survives short restarts)
+  const due = (slot: string, at?: string) => {
+    if (!at) return false;
+    const diff = now - toMin(at);
+    return diff >= 0 && diff < 120 && !firedSlots.has(`${date}-${slot}`);
+  };
+
+  if (due("morning", MORNING_TIME)) {
+    firedSlots.add(`${date}-morning`);
+    const tasks = await loadTasks(date);
+    await dmOwner(tasks.length
+      ? `☀️ *Good morning! Today's tasks*\n\n${formatTasks(tasks)}`
+      : "☀️ Good morning! No tasks planned for today. Add some: `#todo #today task one; task two`");
+  }
+
+  if (due("evening", EVENING_TIME)) {
+    firedSlots.add(`${date}-evening`);
+    const tasks = await loadTasks(date);
+    if (!tasks.length) {
+      await dmOwner("🌙 No tasks were planned today. Plan tomorrow: `#todo task one; task two`");
+    } else if (tasks.every(t => t.done)) {
+      await dmOwner(`🌙 All ${tasks.length} tasks done today — nice. Plan tomorrow with \`#todo ...\``);
+    } else {
+      await dmOwner(`🌙 *Evening check-in* — ${tasks.length} tasks today:\n\n${formatTasks(tasks)}\n\nHow many did you finish? Reply \`#done 1 3\` (task numbers), \`#done all\` or \`#done none\`.\nThen plan tomorrow: \`#todo task one; task two\``);
+    }
+  }
+}
+
+// ── Health check server (cloud hosts expect an open port + uptime pinger hits it) ──
 import { createServer } from "http";
-createServer((_req, res) => { res.writeHead(200); res.end("Mastiska is running"); })
+createServer((_req, res) => { res.writeHead(200); res.end("mastiska is running"); })
   .listen(Number(process.env.PORT) || 8000);
 
 // ── Boot ──────────────────────────────────────────────────────────
 (async () => {
   await app.start();
+
+  if (OWNER_SLACK_ID) {
+    setInterval(() => runScheduler().catch(e => console.error("[mastiska] Scheduler error:", e)), 30_000);
+    console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
+  } else {
+    console.log("ℹ️ OWNER_SLACK_ID not set — scheduled check-ins disabled.");
+  }
+
   console.log(`
 ╔══════════════════════════════════════════╗
-║   Mastiska — AI Second Brain             ║
+║   mastiska — AI Second Brain             ║
 ║   Slack + Groq + Obsidian Vault          ║
 ╠══════════════════════════════════════════╣
 ║   Socket Mode: ✅ Connected              ║
