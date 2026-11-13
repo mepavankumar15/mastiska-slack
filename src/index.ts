@@ -273,7 +273,7 @@ async function loadTasks(date: string): Promise<Task[]> {
 }
 
 // Marks tasks done (by 1-based number), "all", or "none" (reset). Writes a Result line.
-async function markDone(date: string, which: number[] | "all" | "none") {
+async function markDone(date: string, which: number[] | "all" | "none", undo = false) {
   const f = await vaultRead(`Todos/${date}.md`);
   if (!f) return null;
   let n = 0;
@@ -285,7 +285,7 @@ async function markDone(date: string, which: number[] | "all" | "none") {
       if (!m) return l;
       n++;
       const wasDone = m[1].toLowerCase() === "x";
-      const done = which === "all" ? true : which === "none" ? false : wasDone || which.includes(n);
+      const done = which === "all" ? true : which === "none" ? false : undo ? wasDone && !which.includes(n) : wasDone || which.includes(n);
       return `- [${done ? "x" : " "}] ${m[2]}`;
     });
   const tasks = parseTasks(lines.join("\n"));
@@ -318,6 +318,7 @@ const HELP = `👋 *Mastiska — Your AI Second Brain*
 \`#todo #today task\` → add to today's list
 \`#tasks\` → today's tasks (\`#tasks #tomorrow\` for tomorrow)
 \`#done 1 3\` → mark tasks 1 and 3 done (\`#done all\` / \`#done none\`)
+\`#undone 2\` → mark task 2 not done again
 _Evening check-in DM asks how many you finished._
 
 *📰 Hacker News*
@@ -375,16 +376,17 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   }
 
   // ── #done — mark today's tasks ───────────────────────────────────
-  if (tags.includes("done")) {
+  if (tags.includes("done") || tags.includes("undone")) {
+    const undo = tags.includes("undone");
     const arg = clean.replace(/#\w+/g, "").trim().toLowerCase();
     let which: number[] | "all" | "none";
-    if (arg === "all") which = "all";
+    if (arg === "all") which = undo ? "none" : "all";
     else if (arg === "none" || arg === "0") which = "none";
     else {
       which = (arg.match(/\d+/g) ?? []).map(Number);
       if (!which.length) { await say("Which tasks? Reply with task numbers: `#done 1 3`, or `#done all` / `#done none`"); return; }
     }
-    const res = await markDone(istDate(), which);
+    const res = await markDone(istDate(), which, undo);
     if (!res) { await say("No tasks found for today. Add some with `#todo #today task one; task two`"); return; }
     if (!res.ok) { await say(SAVE_FAILED); return; }
     const left = res.total - res.done;
@@ -535,7 +537,7 @@ app.event("app_mention", async ({ event, say }) => {
   try {
     await handleMessage(event.text, event.channel, say);
   } catch (err) {
-    console.error("[mastiska] Error:", err);
+    console.error("[Mastiska] Error:", err);
   }
 });
 
@@ -546,7 +548,7 @@ app.message(async ({ message, say }) => {
   try {
     await handleMessage(msg.text ?? "", msg.channel, say);
   } catch (err) {
-    console.error("[mastiska] DM error:", err);
+    console.error("[Mastiska] DM error:", err);
   }
 });
 
@@ -591,7 +593,7 @@ async function runScheduler() {
 
 // ── Health check server (cloud hosts expect an open port + uptime pinger hits it) ──
 import { createServer } from "http";
-createServer((_req, res) => { res.writeHead(200); res.end("mastiska is running"); })
+createServer((_req, res) => { res.writeHead(200); res.end("Mastiska is running"); })
   .listen(Number(process.env.PORT) || 8000);
 
 // ── Boot ──────────────────────────────────────────────────────────
@@ -599,7 +601,7 @@ createServer((_req, res) => { res.writeHead(200); res.end("mastiska is running")
   await app.start();
 
   if (OWNER_SLACK_ID) {
-    setInterval(() => runScheduler().catch(e => console.error("[mastiska] Scheduler error:", e)), 30_000);
+    setInterval(() => runScheduler().catch(e => console.error("[Mastiska] Scheduler error:", e)), 30_000);
     console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
   } else {
     console.log("ℹ️ OWNER_SLACK_ID not set — scheduled check-ins disabled.");
@@ -607,7 +609,7 @@ createServer((_req, res) => { res.writeHead(200); res.end("mastiska is running")
 
   console.log(`
 ╔══════════════════════════════════════════╗
-║   mastiska — AI Second Brain             ║
+║   Mastiska — AI Second Brain             ║
 ║   Slack + Groq + Obsidian Vault          ║
 ╠══════════════════════════════════════════╣
 ║   Socket Mode: ✅ Connected              ║
