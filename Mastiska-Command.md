@@ -14,6 +14,7 @@ Times are IST. Separate several tasks with `;` or new lines.
 | `#done 1 3` | Mark tasks 1 and 3 done (use the numbers shown) |
 | `#done all` | Mark every task done |
 | `#done none` | Reset all to not done |
+| `#undone 2` | Mark task 2 not done again |
 
 Evening check-in: the bot DMs you at 21:00 IST (change with EVENING_TIME) with today's list.
 Reply `#done 1 3`. It stores `**Result:** 2/3 done` in the day's file.
@@ -31,7 +32,11 @@ Optional morning push: set MORNING_TIME=07:30 on Render.
 | `#gym chest day, bench 5x5 60kg` | Today's workout log (Gym/DATE.md) |
 | `#gym #pr bench 70kg` | Personal record (Gym/progress.md) |
 | `#gym #weight 72` | Body weight (Gym/progress.md) |
-| `#gym summary` | AI summary of your progress |
+| `#gym show` | View today's workout log |
+| `#gym yesterday` | View yesterday's log |
+| `#gym week` | View the last 7 days |
+| `#gym 2026-11-12` | View a specific date |
+| `#gym summary` | AI summary of PRs and weight |
 
 ## Ideas  ->  Ideas/
 | Command | What it does |

@@ -311,7 +311,9 @@ const HELP = `👋 *Mastiska — Your AI Second Brain*
 \`#gym [workout details]\` → today's workout log
 \`#gym #pr [lift] [weight]\` → logs a personal record
 \`#gym #weight [kg]\` → logs body weight
-\`#gym summary\` → shows this week
+\`#gym show\` / \`#gym yesterday\` / \`#gym week\` → view logs
+\`#gym 2026-11-12\` → view a specific date
+\`#gym summary\` → AI summary of PRs & weight
 
 *✅ Todos*
 \`#todo task one; task two\` → plan tomorrow's tasks
@@ -443,6 +445,24 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
       return;
     }
 
+    // View logs: `#gym show`, `#gym yesterday`, `#gym week`, `#gym 2026-11-12`
+    const view = content.toLowerCase();
+    if (/^(show|today|yesterday|week|\d{4}-\d{2}-\d{2})$/.test(view)) {
+      const days = view === "week" ? [0, -1, -2, -3, -4, -5, -6].map(o => istDate(o))
+        : [view === "yesterday" ? istDate(-1) : /^\d/.test(view) ? view : istDate()];
+      const parts: string[] = [];
+      for (const d of days) {
+        const f = await vaultRead(`Gym/${d}.md`);
+        if (f) parts.push(f.content.trim());
+      }
+      if (!parts.length) {
+        await say(view === "week" ? "No workouts logged in the last 7 days." : `No workout logged for *${days[0]}*.`);
+        return;
+      }
+      await say(`🏋️ *Gym log${view === "week" ? " — last 7 days" : ` — ${days[0]}`}*\n\n${parts.join("\n\n———\n\n")}`);
+      return;
+    }
+
     // Regular workout log
     const ok = await appendEntry(`Gym/${date}.md`, `# Workout — ${date}\n`, `\n### ${istTime()}\n${content || "Workout logged"}`);
     await say(ok ? `💪 Workout logged to *Gym/${date}.md*` : SAVE_FAILED);
@@ -532,7 +552,7 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
 
 // ── Slack event listeners ─────────────────────────────────────────
 
-// Mentioned in a channel: @HermesOG #nifty #thread ...
+// Mentioned in a channel: @mastiska #nifty #thread ...
 app.event("app_mention", async ({ event, say }) => {
   try {
     await handleMessage(event.text, event.channel, say);
