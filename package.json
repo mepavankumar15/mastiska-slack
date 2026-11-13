@@ -1,7 +1,7 @@
 {
-  "name": "arthavid-slack",
+  "name": "mastiska-slack",
   "version": "1.0.0",
-  "description": "ArthaVid — AI second brain bot for Slack",
+  "description": "Mastiska — AI second brain bot for Slack",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

@@ -1,6 +1,6 @@
-# ArthaVid Commands (Slack second brain)
+# Mastiska Commands (Slack second brain)
 
-Where to type: DM the bot (no mention needed). In a channel, mention it first: `@ArthaVid #note ...`
+Where to type: DM the bot (no mention needed). In a channel, mention it first: `@Mastiska #note ...`
 Every entry is saved to your GitHub vault (angadha-vault) and shows up in Obsidian.
 Times are IST. Separate several tasks with `;` or new lines.
 
