@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { App } from "@slack/bolt";
 import Groq from "groq-sdk";
+import { gunzipSync } from "zlib";
 
 // ── Config ────────────────────────────────────────────────────────
 const SLACK_BOT_TOKEN  = process.env.SLACK_BOT_TOKEN!;
@@ -16,6 +17,7 @@ const OWNER_SLACK_ID   = process.env.OWNER_SLACK_ID;           // enables the sc
 const EVENING_TIME     = process.env.EVENING_TIME || "21:00";   // IST, "how many tasks did you finish?"
 const MORNING_TIME     = process.env.MORNING_TIME;              // IST, optional morning push (e.g. "07:30")
 const HN_DIGEST_TIME   = process.env.HN_DIGEST_TIME || "10:00"; // IST, daily HN tech + markets digest ("off" to disable)
+const WEEKLY_REVIEW_TIME = process.env.WEEKLY_REVIEW_TIME || "19:00"; // IST, every Sunday ("off" to disable)
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !GROQ_API_KEY) {
   console.error("❌ Missing required env vars. Check .env file.");
@@ -48,6 +50,11 @@ function istTime(): string {
 //   HackerNews/YYYY-MM-DD.md
 //   Notes/YYYY-MM-DD.md
 //   Todos/YYYY-MM-DD.md — daily task checklist + result line
+//   Expenses/YYYY-MM.md — one line per expense
+//   Habits/YYYY-MM.md   — one line per habit log
+//   Links/reading-list.md — saved links with AI summary
+//   Reminders/reminders.md — pending (- [ ]) and fired (- [x]) reminders
+//   Reviews/YYYY-MM-DD.md — weekly reviews
 
 const SAVE_FAILED = "⚠️ Couldn't write to your vault (GitHub rejected it — check GITHUB_TOKEN / repo name / rate limit). Nothing was saved.";
 
@@ -86,6 +93,7 @@ async function vaultWrite(path: string, newLines: string, append = true): Promis
       sha: existing?.sha,
     }),
   });
+  if (res.ok) snapCache = null; // vault changed → drop the cached snapshot
   return res.ok;
 }
 
@@ -333,7 +341,19 @@ Just type anything (no tag) → saved to today's Notes file
 \`#tasks\` → today's tasks (\`#tasks #tomorrow\` for tomorrow)
 \`#done 1 3\` → mark tasks 1 and 3 done (\`#done all\` / \`#done none\`)
 \`#undone 2\` → mark task 2 not done again
+\`#carry\` → move today's unfinished tasks to tomorrow
 _Evening check-in DM asks how many you finished._
+
+*🧠 Second brain*
+\`#find pricing idea\` → search your whole vault
+\`#spend 250 food lunch\` → log expense (\`#spend month\` · \`week\` · \`undo\`)
+\`#remind 5pm call mom\` → DM reminder (\`tomorrow 9am …\`, \`in 30m …\`, \`#remind list\`)
+\`#habit water 3L\` → log habit (\`#habit week\` for streaks)
+Paste a link (or \`#link url\`) → reading list with AI summary
+\`#clean [rambling text]\` → tidy bullets, saved to Notes
+\`#review\` → weekly review now (auto every Sunday evening)
+
+*⚡ Prefixes:* \`i:\` idea · \`p:\` project · \`g:\` gym · \`n:\` note · \`t:\` todo · \`d:\` done · \`s:\` spend · \`r:\` remind · \`f:\` find · \`l:\` link · \`c:\` clean · \`h:\` habit
 
 *📰 Hacker News*
 \`#hn\` → top fintech stories right now
@@ -355,6 +375,347 @@ _Evening check-in DM asks how many you finished._
 *Format tags:* \`#thread\` \`#li\` \`#ig\` \`#yt\` \`#all\` \`#score\` \`#hook\` \`#ideas\` \`#explain\` \`#story\`
 *Trade tags:* \`#bull\` \`#bear\` \`#breakout\` \`#swing\` \`#intraday\` \`#longterm\` \`#fundamentals\` \`#technical\` \`#risk\``;
 
+// ═══════════════════════════════════════════════════════════════════
+//  Second-brain extras: vault snapshot + search, expenses, habits,
+//  reminders, link saver, weekly review
+// ═══════════════════════════════════════════════════════════════════
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : "unknown");
+
+// AI answers are markdown; Slack wants *bold* and "•" bullets
+function toSlack(md: string): string {
+  return md
+    .replace(/\*\*(.+?)\*\*/g, "*$1*")
+    .replace(/^#{1,6}\s+(.+)$/gm, "*$1*")
+    .replace(/^\s*[-*]\s+/gm, "• ");
+}
+
+// ── Vault snapshot: the whole repo in ONE request (tarball) ───────
+let snapCache: { at: number; files: Map<string, string> } | null = null;
+
+function parseTar(buf: Buffer): Map<string, string> {
+  const files = new Map<string, string>();
+  let off = 0;
+  let nextName: string | null = null;
+  while (off + 512 <= buf.length) {
+    const header = buf.subarray(off, off + 512);
+    if (header.every(b => b === 0)) break;
+    const str = (s: number, e: number) => header.toString("utf8", s, e).replace(/\0[\s\S]*$/, "");
+    let name = str(0, 100);
+    const prefix = str(345, 500);
+    if (prefix) name = `${prefix}/${name}`;
+    const size = parseInt(str(124, 136).trim() || "0", 8);
+    const type = String.fromCharCode(header[156]);
+    off += 512;
+    const data = buf.subarray(off, off + size);
+    off += Math.ceil(size / 512) * 512;
+    if (type === "x") { // pax header: carries the real name of the next entry
+      const m = data.toString("utf8").match(/\d+ path=([^\n]+)\n/);
+      if (m) nextName = m[1];
+      continue;
+    }
+    if (type === "g") continue; // global pax header (commit id)
+    const full = nextName ?? name;
+    nextName = null;
+    if ((type === "0" || type === "\0") && full.endsWith(".md")) {
+      const path = full.split("/").slice(1).join("/"); // drop "owner-repo-sha/" folder
+      if (path && !path.split("/").some(seg => seg.startsWith("."))) files.set(path, data.toString("utf8"));
+    }
+  }
+  return files;
+}
+
+async function loadVault(maxAgeMs = 30_000): Promise<Map<string, string>> {
+  if (snapCache && Date.now() - snapCache.at < maxAgeMs) return snapCache.files;
+  if (!GITHUB_TOKEN) return new Map();
+  const res = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_VAULT}/tarball`, {
+    headers: { Authorization: `token ${GITHUB_TOKEN}`, Accept: "application/vnd.github+json" },
+  });
+  if (!res.ok) throw new Error(`GitHub tarball ${res.status}`);
+  const files = parseTar(gunzipSync(Buffer.from(await res.arrayBuffer())));
+  snapCache = { at: Date.now(), files };
+  return files;
+}
+
+// ── #find ─────────────────────────────────────────────────────────
+async function findInVault(query: string): Promise<string> {
+  const files = await loadVault(0);
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const dateOf = (p: string) => p.match(/\d{4}-\d{2}(-\d{2})?/)?.[0] ?? "";
+  const paths = [...files.keys()].sort((a, b) => dateOf(b).localeCompare(dateOf(a)) || a.localeCompare(b));
+  const hits: { path: string; line: string }[] = [];
+  for (const p of paths) {
+    for (const line of files.get(p)!.split("\n")) {
+      const t = line.trim();
+      if (t && words.every(w => t.toLowerCase().includes(w))) hits.push({ path: p, line: t });
+    }
+  }
+  if (!hits.length) return `🔎 Nothing found for *${query}*. Try fewer or different words.`;
+  const shown = hits.slice(0, 15).map(h => `*${h.path}* — ${h.line.length > 180 ? h.line.slice(0, 180) + "…" : h.line}`);
+  return `🔎 *${hits.length} match${hits.length > 1 ? "es" : ""} for "${query}"*${hits.length > 15 ? " (showing newest 15)" : ""}\n\n${shown.join("\n")}`;
+}
+
+// ── Expenses (Expenses/YYYY-MM.md) ────────────────────────────────
+type Expense = { date: string; amount: number; cat: string; note: string };
+const EXP_LINE = /^- (\d{4}-\d{2}-\d{2}) \| ([\d.]+) \| ([^|]*) \| ?(.*)$/;
+const inr = (n: number) => "₹" + n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+
+function parseExpenses(content: string): Expense[] {
+  const out: Expense[] = [];
+  for (const line of content.split("\n")) {
+    const m = line.match(EXP_LINE);
+    if (m) out.push({ date: m[1], amount: parseFloat(m[2]), cat: m[3].trim() || "misc", note: m[4] });
+  }
+  return out;
+}
+
+function byCategory(exps: Expense[]): string {
+  const totals = new Map<string, number>();
+  exps.forEach(e => totals.set(e.cat, (totals.get(e.cat) ?? 0) + e.amount));
+  const total = exps.reduce((s, e) => s + e.amount, 0);
+  const rows = [...totals.entries()].sort((a, b) => b[1] - a[1])
+    .map(([c, v]) => `• ${c}: ${inr(v)} (${Math.round((v / total) * 100)}%)`);
+  return `${rows.join("\n")}\n*Total: ${inr(total)}* · ${exps.length} entr${exps.length === 1 ? "y" : "ies"}`;
+}
+
+async function loadExpenses(months: string[]): Promise<Expense[]> {
+  const all: Expense[] = [];
+  for (const m of months) {
+    const f = await vaultRead(`Expenses/${m}.md`);
+    if (f) all.push(...parseExpenses(f.content));
+  }
+  return all;
+}
+
+// ── Habits (Habits/YYYY-MM.md) ────────────────────────────────────
+const HABIT_LINE = /^- (\d{4}-\d{2}-\d{2}) \| ([^|]+) \| (.*)$/;
+type HabitLog = { date: string; name: string; value: string };
+
+function parseHabits(content: string): HabitLog[] {
+  const out: HabitLog[] = [];
+  for (const line of content.split("\n")) {
+    const m = line.match(HABIT_LINE);
+    if (m) out.push({ date: m[1], name: m[2].trim(), value: m[3].trim() });
+  }
+  return out;
+}
+
+async function loadHabits(months: string[]): Promise<HabitLog[]> {
+  const all: HabitLog[] = [];
+  for (const m of months) {
+    const f = await vaultRead(`Habits/${m}.md`);
+    if (f) all.push(...parseHabits(f.content));
+  }
+  return all;
+}
+
+const dayRange = (n: number) => [...Array(n)].map((_, i) => istDate(-(n - 1 - i))); // oldest → today
+const monthsOf = (days: string[]) => [...new Set(days.map(d => d.slice(0, 7)))];
+
+async function habitWeek(): Promise<string> {
+  const days = dayRange(7);
+  const logs = (await loadHabits(monthsOf(days))).filter(l => days.includes(l.date));
+  if (!logs.length) return "No habits logged in the last 7 days. Try `#habit water 3L` or `#habit sleep 7h`.";
+  const names = [...new Set(logs.map(l => l.name))].sort();
+  const rows = names.map(n => {
+    const byDay = new Map<string, string>();
+    logs.filter(l => l.name === n).forEach(l => byDay.set(l.date, l.value));
+    const marks = days.map(d => (byDay.has(d) ? "✅" : "⬜")).join("");
+    let streak = 0;
+    for (let i = days.length - 1; i >= 0; i--) {
+      if (byDay.has(days[i])) streak++;
+      else if (i === days.length - 1) continue; // today not logged yet — don't break the streak
+      else break;
+    }
+    const last = byDay.get(days[days.length - 1]) ?? byDay.get(days[days.length - 2]) ?? "";
+    return `*${n}*  ${marks}  ${byDay.size}/7 · streak ${streak}${last && last !== "✓" ? ` · latest ${last}` : ""}`;
+  });
+  return `📈 *Habits — last 7 days* (oldest → today)\n\n${rows.join("\n")}`;
+}
+
+// ── Reminders (Reminders/reminders.md) ────────────────────────────
+type Reminder = { whenMs: number; text: string; line: string };
+const REMINDER_FILE = "Reminders/reminders.md";
+const REMINDER_LINE = /^- \[ \] (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) \| (.+)$/;
+let reminders: Reminder[] = [];
+
+const istParts = (ms: number) => {
+  const d = new Date(ms + 5.5 * 3600000);
+  return { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate() };
+};
+const istToMs = (y: number, mo: number, d: number, h: number, mi: number) => Date.UTC(y, mo, d, h, mi) - 5.5 * 3600000;
+const fmtIST = (ms: number) => new Date(ms + 5.5 * 3600000).toISOString().replace("T", " ").slice(0, 16);
+
+// "5pm …", "17:30 …", "tomorrow 9am …", "2026-12-01 18:00 …", "in 30m …"
+function parseWhen(input: string): { whenMs: number; rest: string } | null {
+  let s = input.trim();
+  const now = Date.now();
+  let m = s.match(/^in\s+(\d+)\s*(m|min|mins|minutes?|h|hr|hrs|hours?)\b\s*/i);
+  if (m) {
+    const hours = /^h/i.test(m[2]);
+    return { whenMs: now + Number(m[1]) * (hours ? 3600000 : 60000), rest: s.slice(m[0].length) };
+  }
+  let dateParts: [number, number, number] | null = null;
+  let dayOffset: number | null = null;
+  if ((m = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+/))) { dateParts = [+m[1], +m[2] - 1, +m[3]]; s = s.slice(m[0].length); }
+  else if ((m = s.match(/^tomorrow\s+/i))) { dayOffset = 1; s = s.slice(m[0].length); }
+  else if ((m = s.match(/^today\s+/i))) { dayOffset = 0; s = s.slice(m[0].length); }
+  const t = s.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\w)\s*/i);
+  if (!t || (!t[2] && !t[3])) return null; // "5" alone is ambiguous — need am/pm or HH:MM
+  let h = +t[1];
+  const mi = t[2] ? +t[2] : 0;
+  if (t[3]) { if (h < 1 || h > 12) return null; h = (h % 12) + (t[3].toLowerCase() === "pm" ? 12 : 0); }
+  if (h > 23 || mi > 59) return null;
+  const p = istParts(now);
+  let when = dateParts
+    ? istToMs(dateParts[0], dateParts[1], dateParts[2], h, mi)
+    : istToMs(p.y, p.mo, p.d + (dayOffset ?? 0), h, mi);
+  if (!dateParts && dayOffset === null && when <= now) when += 86400000; // time already passed today → tomorrow
+  return { whenMs: when, rest: s.slice(t[0].length) };
+}
+
+async function loadReminders(): Promise<void> {
+  const f = await vaultRead(REMINDER_FILE);
+  reminders = [];
+  if (!f) return;
+  for (const line of f.content.split("\n")) {
+    const m = line.match(REMINDER_LINE);
+    if (m) reminders.push({ whenMs: Date.parse(`${m[1]}T${m[2]}:00+05:30`), text: m[3], line });
+  }
+}
+
+async function markReminder(line: string, mark: string): Promise<void> {
+  const f = await vaultRead(REMINDER_FILE);
+  if (!f) return;
+  const body = f.content.split("\n").map(l => (l === line ? l.replace("- [ ]", `- [${mark}]`) : l)).join("\n");
+  await vaultWrite(REMINDER_FILE, body.trimEnd(), false);
+}
+
+// ── Link saver (Links/reading-list.md) ────────────────────────────
+function extractUrl(text: string): string | null {
+  const slack = text.match(/<(https?:[^|>]+)(?:\|[^>]*)?>/);
+  if (slack) return slack[1];
+  return text.match(/https?:\/\/[^\s<>]+/i)?.[0] ?? null;
+}
+
+function isPrivateHost(h: string): boolean {
+  h = h.toLowerCase();
+  return h === "localhost" || h.endsWith(".local") || h.endsWith(".internal") || h === "[::1]" ||
+    /^(127\.|10\.|0\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h);
+}
+
+const decodeEntities = (s: string) =>
+  s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ");
+
+async function fetchPage(url: string): Promise<{ title: string; text: string } | null> {
+  try {
+    const u = new URL(url);
+    if (!/^https?:$/.test(u.protocol) || isPrivateHost(u.hostname)) return null;
+    const res = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(8000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; MastiskaLinkSaver/1.0)" },
+    });
+    if (!res.ok || !(res.headers.get("content-type") ?? "").includes("text/html")) return null;
+    const html = (await res.text()).slice(0, 400_000);
+    const title = decodeEntities((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "").replace(/\s+/g, " ").trim());
+    const text = decodeEntities(
+      html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>|<[^>]+>/g, " ").replace(/\s+/g, " ").trim()
+    ).slice(0, 6000);
+    return { title, text };
+  } catch {
+    return null;
+  }
+}
+
+async function saveLink(text: string, say: Function): Promise<void> {
+  const url = extractUrl(text);
+  if (!url) { await say("Send a link to save, like `#link https://example.com`"); return; }
+  const userNote = unslack(text.replace(/<https?:[^>]+>/g, "").replace(/https?:\/\/\S+/g, "").replace(/#\w+/g, "")).trim();
+  await say("🔗 Reading the page...");
+  const page = await fetchPage(url);
+  let summary = "";
+  if (page && page.text.length > 200) {
+    try {
+      summary = (await askGroq(
+        "Summarize this web page in 2 short sentences: what it is and why it might be useful. Plain text, no markdown, no preamble.",
+        `Title: ${page.title}\n\n${page.text}`
+      )).replace(/\s+/g, " ").trim();
+    } catch { /* keep the link even if the summary fails */ }
+  }
+  const title = (page?.title || new URL(url).hostname).replace(/[\[\]]/g, "");
+  const line = `- [ ] [${title}](${url})${summary ? ` — ${summary}` : ""}${userNote ? ` — _note: ${userNote}_` : ""}  _(${istDate()})_`;
+  const ok = await appendEntry("Links/reading-list.md", "# Reading List\n\n", line);
+  await say(ok
+    ? `🔗 Saved to *Links/reading-list.md*\n*${title}*${summary ? `\n${summary}` : "\n_(couldn't read the page, saved the link only)_"}`
+    : SAVE_FAILED);
+}
+
+// ── Weekly review ─────────────────────────────────────────────────
+const istDow = () => new Date(Date.now() + 5.5 * 3600000).getUTCDay(); // 0 = Sunday
+
+async function buildWeeklyReview(): Promise<{ text: string; saved: boolean }> {
+  const files = await loadVault(0);
+  const get = (p: string) => files.get(p) ?? "";
+  const days = dayRange(7);
+  const inWeek = (line: string) => { const m = line.match(/_\((\d{4}-\d{2}-\d{2})/); return !!m && days.includes(m[1]); };
+
+  let done = 0, total = 0;
+  const unfinished: string[] = [];
+  for (const d of days) {
+    const ts = parseTasks(get(`Todos/${d}.md`));
+    total += ts.length;
+    done += ts.filter(t => t.done).length;
+    ts.filter(t => !t.done).forEach(t => unfinished.push(t.text));
+  }
+  const gym = days.filter(d => get(`Gym/${d}.md`).trim());
+  const notes = days.filter(d => get(`Notes/${d}.md`).trim());
+  const noteCount = notes.reduce((n, d) => n + (get(`Notes/${d}.md`).match(/^### /gm)?.length ?? 0), 0);
+  const ideas = [...get("Ideas/content-ideas.md").split("\n"), ...get("Ideas/project-ideas.md").split("\n")]
+    .filter(l => l.startsWith("- ") && inWeek(l));
+  const links = get("Links/reading-list.md").split("\n").filter(l => l.startsWith("- ") && inWeek(l));
+  const expenses = monthsOf(days).flatMap(m => parseExpenses(get(`Expenses/${m}.md`))).filter(e => days.includes(e.date));
+  const spent = expenses.reduce((s, e) => s + e.amount, 0);
+  const habits = monthsOf(days).flatMap(m => parseHabits(get(`Habits/${m}.md`))).filter(h => days.includes(h.date));
+  const habitDays = new Map<string, Set<string>>();
+  habits.forEach(h => habitDays.set(h.name, (habitDays.get(h.name) ?? new Set()).add(h.date)));
+
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  const stats = [
+    `✅ Tasks: ${total ? `${done}/${total} done (${pct}%)` : "none planned"}`,
+    `🏋️ Gym: ${gym.length} session${gym.length === 1 ? "" : "s"}`,
+    `📝 Notes: ${noteCount} · 💡 Ideas: ${ideas.length} · 🔗 Links: ${links.length}`,
+    `💸 Spent: ${inr(spent)}`,
+    habitDays.size ? `📈 Habits: ${[...habitDays.entries()].map(([n, s]) => `${n} ${s.size}/7`).join(", ")}` : "",
+  ].filter(Boolean).join("\n");
+  const header = `📅 *Weekly review — ${days[0]} → ${days[6]}*\n\n${stats}`;
+
+  const hasData = total || gym.length || noteCount || ideas.length || links.length || expenses.length || habits.length;
+  if (!hasData) return { text: `${header}\n\nNothing logged this week yet — capture a few thoughts and I'll have more to work with next Sunday.`, saved: false };
+
+  const cap = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
+  const context = [
+    `TASKS: ${done}/${total} done. Unfinished: ${unfinished.join("; ") || "none"}`,
+    `GYM SESSIONS (${gym.length}):\n${gym.map(d => `[${d}] ${cap(get(`Gym/${d}.md`).replace(/^# .*\n/, "").trim(), 500)}`).join("\n")}`,
+    `NOTES:\n${cap(notes.map(d => `[${d}] ${get(`Notes/${d}.md`).replace(/^# .*\n/, "").trim()}`).join("\n"), 6000)}`,
+    `IDEAS:\n${ideas.join("\n")}`,
+    `LINKS SAVED:\n${cap(links.join("\n"), 1500)}`,
+    `SPENDING:\n${expenses.length ? byCategory(expenses) : "none"}`,
+    `HABITS:\n${[...habitDays.entries()].map(([n, s]) => `${n}: ${s.size}/7 days`).join("\n") || "none"}`,
+  ].join("\n\n");
+
+  let ai: string;
+  try {
+    ai = await askGroq(
+      "You are a thoughtful second-brain coach reviewing the user's week from their own logs. Write: *What went well* (2-3 bullets), *What slipped* (1-3 bullets), *Themes in my notes and ideas* (1-3 bullets), *Focus for next week* (exactly 3 concrete bullets). Under 220 words. Use ONLY the data given — do not invent events. Address the user as 'you'.",
+      context
+    );
+  } catch (e) {
+    ai = `_(AI summary unavailable: ${errMsg(e)})_`;
+  }
+  const saved = await vaultWrite(`Reviews/${istDate()}.md`, `# Weekly Review — ${days[0]} → ${days[6]}\n\n${stats.replace(/\*/g, "")}\n\n${ai}`, false);
+  return { text: `${header}\n\n${toSlack(ai)}${saved ? `\n\n_Saved to Reviews/${istDate()}.md_` : ""}`, saved };
+}
+
 // Slack wraps links as <url|label> and escapes & < > — turn that back into clean markdown
 function unslack(s: string): string {
   return s
@@ -373,12 +734,22 @@ async function saveQuickNote(text: string, say: Function): Promise<void> {
 // ── Core message handler ──────────────────────────────────────────
 async function handleMessage(text: string, channelId: string, say: Function): Promise<void> {
   // Strip bot mention
-  const clean = text.replace(/<@[A-Z0-9]+>/gi, "").trim();
+  let clean = text.replace(/<@[A-Z0-9]+>/gi, "").trim();
 
   // Empty → help
   if (!clean) { await say(HELP); return; }
 
+  // Short prefixes: "i: my idea" → "#idea my idea"
+  const PREFIXES: Record<string, string> = {
+    i: "idea", p: "project", g: "gym", n: "note", t: "todo", d: "done",
+    s: "spend", r: "remind", f: "find", l: "link", c: "clean", h: "habit",
+  };
+  const pm = clean.match(/^([a-z])\s*:\s*([\s\S]*)$/i);
+  if (pm && PREFIXES[pm[1].toLowerCase()]) clean = `#${PREFIXES[pm[1].toLowerCase()]} ${pm[2]}`.trim();
+
   const tags = clean.toLowerCase().match(/#\w+/g)?.map(t => t.slice(1)) ?? [];
+  const cmd = tags[0]; // the new commands only trigger when they are the FIRST tag
+  const arg = clean.replace(/#\w+/g, "").trim();
 
   // ── #save ────────────────────────────────────────────────────────
   if (tags.includes("save")) {
@@ -387,6 +758,156 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
     const date = istDate();
     const saved = await vaultWrite(`Notes/${date}.md`, `\n## Saved ${istTime()}\n\n${last}`);
     await say(saved ? `✅ Saved to Notes/${date}.md in your vault.` : "⚠️ Saved locally (GitHub vault not configured).");
+    return;
+  }
+
+  // ── #find — search the whole vault ───────────────────────────────
+  if (cmd === "find") {
+    if (!arg) { await say("What should I search for? Try `#find pricing idea`"); return; }
+    try { await say(await findInVault(arg)); } catch (e) { await say(`❌ Search failed: ${errMsg(e)}`); }
+    return;
+  }
+
+  // ── #spend — expense log ─────────────────────────────────────────
+  if (cmd === "spend") {
+    const low = arg.toLowerCase();
+    const ym = istDate().slice(0, 7);
+    try {
+      const mm = low.match(/^month(?:\s+(\d{4}-\d{2}))?$/);
+      if (mm) {
+        const exps = await loadExpenses([mm[1] ?? ym]);
+        await say(exps.length ? `💸 *Spending — ${mm[1] ?? ym}*\n\n${byCategory(exps)}` : `No expenses logged for ${mm[1] ?? ym}.`);
+        return;
+      }
+      if (low === "week") {
+        const days = dayRange(7);
+        const exps = (await loadExpenses(monthsOf(days))).filter(e => days.includes(e.date));
+        await say(exps.length ? `💸 *Spending — last 7 days*\n\n${byCategory(exps)}` : "No expenses in the last 7 days.");
+        return;
+      }
+      if (low === "undo") {
+        const f = await vaultRead(`Expenses/${ym}.md`);
+        const lines = f ? f.content.split("\n") : [];
+        let idx = -1;
+        lines.forEach((l, i) => { if (EXP_LINE.test(l)) idx = i; });
+        if (!f || idx < 0) { await say("Nothing to undo this month."); return; }
+        const removed = lines.splice(idx, 1)[0];
+        const ok = await vaultWrite(`Expenses/${ym}.md`, lines.join("\n").trimEnd(), false);
+        await say(ok ? `↩️ Removed: ${removed.replace(/^- /, "")}` : SAVE_FAILED);
+        return;
+      }
+      const m = arg.match(/^[₹$]?\s*([\d,]+(?:\.\d+)?)\s*(.*)$/);
+      const amount = m ? parseFloat(m[1].replace(/,/g, "")) : NaN;
+      if (!m || !(amount > 0)) {
+        await say("Log an expense: `#spend 250 food lunch`\nSee totals: `#spend month` · `#spend week` · `#spend undo`");
+        return;
+      }
+      const [first, ...rest] = m[2].trim().split(/\s+/).filter(Boolean);
+      const cat = (first ?? "misc").toLowerCase().replace(/\|/g, "");
+      const note = rest.join(" ").replace(/\|/g, "/");
+      const ok = await appendEntry(`Expenses/${ym}.md`, `# Expenses — ${ym}\n\n`, `- ${istDate()} | ${amount} | ${cat} | ${note}`);
+      if (!ok) { await say(SAVE_FAILED); return; }
+      const total = (await loadExpenses([ym])).reduce((s, e) => s + e.amount, 0);
+      await say(`💸 Saved ${inr(amount)} · ${cat}${note ? ` — ${note}` : ""}\nThis month so far: *${inr(total)}*`);
+    } catch (e) {
+      await say(`❌ Expense error: ${errMsg(e)}`);
+    }
+    return;
+  }
+
+  // ── #habit — log + weekly streak view ────────────────────────────
+  if (cmd === "habit") {
+    try {
+      if (!arg || ["week", "streak", "list"].includes(arg.toLowerCase())) { await say(await habitWeek()); return; }
+      const [name, ...rest] = arg.split(/\s+/);
+      const ym = istDate().slice(0, 7);
+      const value = rest.join(" ").replace(/\|/g, "/") || "✓";
+      const ok = await appendEntry(`Habits/${ym}.md`, `# Habits — ${ym}\n\n`, `- ${istDate()} | ${name.toLowerCase().replace(/\|/g, "")} | ${value}`);
+      await say(ok ? `📈 Logged *${name.toLowerCase()}* ${value === "✓" ? "✓" : `→ ${value}`}  (see \`#habit week\`)` : SAVE_FAILED);
+    } catch (e) {
+      await say(`❌ Habit error: ${errMsg(e)}`);
+    }
+    return;
+  }
+
+  // ── #remind — DM at a time ───────────────────────────────────────
+  if (cmd === "remind") {
+    if (!OWNER_SLACK_ID) { await say("Reminders need `OWNER_SLACK_ID` set in the bot's environment (that's where I send the DM)."); return; }
+    const low = arg.toLowerCase();
+    const pending = [...reminders].sort((a, b) => a.whenMs - b.whenMs);
+    if (!arg || low === "list") {
+      await say(pending.length
+        ? `⏰ *Pending reminders*\n\n${pending.map((r, i) => `${i + 1}. ${fmtIST(r.whenMs)} — ${r.text}`).join("\n")}\n\n_Cancel one: \`#remind cancel 2\`_`
+        : "No pending reminders. Try `#remind 5pm call mom` · `#remind tomorrow 9am gym` · `#remind in 30m tea`");
+      return;
+    }
+    const cm = low.match(/^cancel\s+(\d+)$/);
+    if (cm) {
+      const r = pending[Number(cm[1]) - 1];
+      if (!r) { await say("No reminder with that number. See `#remind list`."); return; }
+      reminders = reminders.filter(x => x !== r);
+      await markReminder(r.line, "x");
+      await say(`🗑️ Cancelled: ${r.text}`);
+      return;
+    }
+    const parsed = parseWhen(arg);
+    if (!parsed) { await say("When? Try `#remind 5pm call mom` · `#remind tomorrow 9am gym` · `#remind in 30m tea` · `#remind 2026-12-01 18:00 pay rent`"); return; }
+    if (parsed.whenMs <= Date.now()) { await say("That time has already passed — pick a future time."); return; }
+    const text = unslack(parsed.rest.trim()).replace(/\s*\n\s*/g, " ");
+    if (!text) { await say("What should I remind you about? `#remind 5pm call mom`"); return; }
+    const whenMs = Math.ceil(parsed.whenMs / 60000) * 60000;
+    const line = `- [ ] ${fmtIST(whenMs)} | ${text}`;
+    const ok = await appendEntry(REMINDER_FILE, "# Reminders\n\n", line);
+    if (!ok) { await say(SAVE_FAILED); return; }
+    reminders.push({ whenMs, text, line });
+    await say(`⏰ Got it — I'll DM you at *${fmtIST(whenMs)} IST*: ${text}`);
+    return;
+  }
+
+  // ── #link — save a link with an AI summary ───────────────────────
+  if (cmd === "link") { await saveLink(clean, say); return; }
+
+  // ── #clean — rambling voice note → tidy bullets (also saved) ─────
+  if (cmd === "clean") {
+    if (!arg) { await say("Paste or dictate your brain-dump after `#clean` and I'll tidy it into bullets."); return; }
+    try {
+      const raw = unslack(arg);
+      const cleaned = await askGroq(
+        "You turn a rambling voice-note transcript into a clean note. Output a short title line, then concise bullet points starting with '- '. Keep EVERY idea, number, name and date. Remove filler words and repetition, fix grammar. Do not add anything new.",
+        raw
+      );
+      const date = istDate();
+      const original = raw.split("\n").map(l => `> ${l}`).join("\n");
+      const ok = await appendEntry(`Notes/${date}.md`, `# Daily Notes — ${date}\n`, `\n### ${istTime()} (cleaned)\n${cleaned.trim()}\n\n<small>Original:</small>\n${original}`);
+      await say(`🧹 *Cleaned*\n\n${toSlack(cleaned)}\n\n${ok ? `_Saved to Notes/${date}.md_` : SAVE_FAILED}`);
+    } catch (e) {
+      await say(`❌ Clean failed: ${errMsg(e)}`);
+    }
+    return;
+  }
+
+  // ── #review — weekly review on demand ────────────────────────────
+  if (cmd === "review") {
+    await say("📅 Reading your week...");
+    try { await say((await buildWeeklyReview()).text); } catch (e) { await say(`❌ Review failed: ${errMsg(e)}`); }
+    return;
+  }
+
+  // ── #carry — move unfinished tasks to tomorrow ───────────────────
+  if (cmd === "carry") {
+    const nums = (arg.match(/\d+/g) ?? []).map(Number);
+    const tasks = await loadTasks(istDate());
+    if (!tasks.length) { await say("No tasks today to carry over."); return; }
+    const pick = tasks.map((t, i) => ({ t, n: i + 1 })).filter(x => !x.t.done && (!nums.length || nums.includes(x.n)));
+    if (!pick.length) { await say("Nothing to carry — everything's done 🎉"); return; }
+    const tomorrow = istDate(1);
+    const have = new Set((await loadTasks(tomorrow)).map(t => t.text.toLowerCase()));
+    const items = pick.map(x => x.t.text).filter(t => !have.has(t.toLowerCase()));
+    if (items.length) {
+      const ok = await appendEntry(`Todos/${tomorrow}.md`, `# Tasks — ${tomorrow}\n\n`, items.map(t => `- [ ] ${t}`).join("\n"));
+      if (!ok) { await say(SAVE_FAILED); return; }
+    }
+    await say(`➡️ Moved ${items.length} task${items.length === 1 ? "" : "s"} to tomorrow${pick.length > items.length ? ` (${pick.length - items.length} already there)` : ""}:\n\n${formatTasks(await loadTasks(tomorrow))}`);
     return;
   }
 
@@ -561,7 +1082,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
 
   // No content-generation tags → it's a quick note. Just type a thought and it's saved.
   if (!hasFintech) {
-    await saveQuickNote(clean, say);
+    if (extractUrl(clean)) await saveLink(clean, say); // a shared link → reading list with AI summary
+    else await saveQuickNote(clean, say);
     return;
   }
 
@@ -611,8 +1133,29 @@ async function dmOwner(text: string) {
   await app.client.chat.postMessage({ channel: OWNER_SLACK_ID!, text });
 }
 
+let schedulerBusy = false;
+
 async function runScheduler() {
+  if (schedulerBusy) return; // don't overlap with a slow previous tick
+  schedulerBusy = true;
+  try { await runSchedulerTick(); } finally { schedulerBusy = false; }
+}
+
+async function runSchedulerTick() {
   const date = istDate();
+
+  // Reminders that have come due (also fires ones missed while the bot was down)
+  for (const r of reminders.filter(x => x.whenMs <= Date.now())) {
+    reminders = reminders.filter(x => x !== r);
+    try {
+      const late = Date.now() - r.whenMs > 10 * 60000;
+      await dmOwner(`⏰ *Reminder:* ${r.text}${late ? `\n_(was due ${fmtIST(r.whenMs)} IST)_` : ""}`);
+    } catch (e) {
+      reminders.push(r); // DM failed → try again on the next tick
+      throw e;
+    }
+    await markReminder(r.line, "x");
+  }
   const now = toMin(istTime());
   // Due if within 2 hours after the target time and not yet sent today (survives short restarts)
   const due = (slot: string, at?: string) => {
@@ -627,6 +1170,16 @@ async function runScheduler() {
     await dmOwner(tasks.length
       ? `☀️ *Good morning! Today's tasks*\n\n${formatTasks(tasks)}`
       : "☀️ Good morning! No tasks planned for today. Add some: `#todo #today task one; task two`");
+  }
+
+  if (istDow() === 0 && due("weekly", WEEKLY_REVIEW_TIME)) {
+    firedSlots.add(`${date}-weekly`);
+    try {
+      await dmOwner((await buildWeeklyReview()).text);
+    } catch (err) {
+      console.error("[Mastiska] Weekly review error:", err);
+      await dmOwner("📅 Couldn't build the weekly review. Try `#review` in a bit.");
+    }
   }
 
   if (due("hn", HN_DIGEST_TIME)) {
@@ -648,7 +1201,7 @@ async function runScheduler() {
     } else if (tasks.every(t => t.done)) {
       await dmOwner(`🌙 All ${tasks.length} tasks done today — nice. Plan tomorrow with \`#todo ...\``);
     } else {
-      await dmOwner(`🌙 *Evening check-in* — ${tasks.length} tasks today:\n\n${formatTasks(tasks)}\n\nHow many did you finish? Reply \`#done 1 3\` (task numbers), \`#done all\` or \`#done none\`.\nThen plan tomorrow: \`#todo task one; task two\``);
+      await dmOwner(`🌙 *Evening check-in* — ${tasks.length} tasks today:\n\n${formatTasks(tasks)}\n\nHow many did you finish? Reply \`#done 1 3\` (task numbers), \`#done all\` or \`#done none\`.\nUnfinished ones: reply \`#carry\` to move them to tomorrow.\nThen plan tomorrow: \`#todo task one; task two\``);
     }
   }
 }
@@ -663,8 +1216,9 @@ createServer((_req, res) => { res.writeHead(200); res.end("Mastiska is running")
   await app.start();
 
   if (OWNER_SLACK_ID) {
+    await loadReminders().catch(e => console.error("[Mastiska] Couldn't load reminders:", e));
     setInterval(() => runScheduler().catch(e => console.error("[Mastiska] Scheduler error:", e)), 30_000);
-    console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST, HN digest ${HN_DIGEST_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
+    console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST, HN digest ${HN_DIGEST_TIME} IST, weekly review Sun ${WEEKLY_REVIEW_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
   } else {
     console.log("ℹ️ OWNER_SLACK_ID not set — scheduled check-ins disabled.");
   }

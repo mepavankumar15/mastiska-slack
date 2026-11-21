@@ -71,3 +71,34 @@ Send an empty message or mention the bot with no text to see the in-Slack help.
 SLACK_BOT_TOKEN, SLACK_APP_TOKEN, GROQ_API_KEY, GROQ_MODEL, GITHUB_TOKEN, GITHUB_OWNER,
 GITHUB_VAULT_REPO=angadha-vault, OWNER_SLACK_ID (your member ID, starts with U),
 EVENING_TIME (default 21:00), MORNING_TIME (optional)
+
+## Second-brain extras
+| Command | What it does |
+|---|---|
+| `#find pricing idea` | Search the whole vault (all words must match), newest first |
+| `#spend 250 food lunch` | Log an expense (amount, category, optional note) |
+| `#spend month` / `#spend month 2026-10` | Totals by category |
+| `#spend week` | Last 7 days |
+| `#spend undo` | Remove the last expense this month |
+| `#remind 5pm call mom` | DM at that time (IST). If the time passed today, it means tomorrow |
+| `#remind tomorrow 9am gym` | Tomorrow |
+| `#remind in 30m tea` | In 30 minutes (also `in 2h`) |
+| `#remind 2026-12-01 18:00 pay rent` | Specific date |
+| `#remind list` / `#remind cancel 2` | See or cancel pending reminders |
+| `#habit water 3L` | Log a habit (name, optional value) |
+| `#habit week` | 7-day view with streaks |
+| (paste a link) or `#link url` | Reading list with AI summary (Links/reading-list.md) |
+| `#clean rambling text` | Tidy bullets, saved to Notes with the original |
+| `#review` | Weekly review now |
+| `#carry` | Move today's unfinished tasks to tomorrow (or `#carry 2 3`) |
+
+Weekly review: automatic every Sunday 19:00 IST (WEEKLY_REVIEW_TIME). Saved to Reviews/.
+Daily HN digest: 10:00 IST (HN_DIGEST_TIME). Evening check-in: 21:00 IST (EVENING_TIME).
+
+## Short prefixes (type less)
+i: idea · p: project · g: gym · n: note · t: todo (tomorrow) · d: done · s: spend · r: remind · f: find · l: link · c: clean · h: habit
+Example: `s: 250 food lunch`, `r: 5pm call mom`, `t: gym; study`
+
+## Notes
+- A message with a link and no tag is saved as a link. Use `#note` to save it as a plain note.
+- Env vars to add on Render if you want to change times: WEEKLY_REVIEW_TIME, HN_DIGEST_TIME, EVENING_TIME.
