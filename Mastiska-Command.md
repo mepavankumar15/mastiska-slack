@@ -23,7 +23,8 @@ Optional morning push: set MORNING_TIME=07:30 on Render.
 ## Notes  ->  Notes/YYYY-MM-DD.md
 | Command | What it does |
 |---|---|
-| `#note any text` | Timestamped note in today's file |
+| (just type anything, no tag) | Quick note, timestamped in today's file |
+| `#note any text` | Same thing, explicit |
 | `#save` | Saves the bot's last generated answer to Notes |
 
 ## Gym  ->  Gym/

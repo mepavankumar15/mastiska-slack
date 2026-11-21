@@ -15,6 +15,7 @@ const MODEL            = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
 const OWNER_SLACK_ID   = process.env.OWNER_SLACK_ID;           // enables the scheduled DMs
 const EVENING_TIME     = process.env.EVENING_TIME || "21:00";   // IST, "how many tasks did you finish?"
 const MORNING_TIME     = process.env.MORNING_TIME;              // IST, optional morning push (e.g. "07:30")
+const HN_DIGEST_TIME   = process.env.HN_DIGEST_TIME || "10:00"; // IST, daily HN tech + markets digest ("off" to disable)
 
 if (!SLACK_BOT_TOKEN || !SLACK_APP_TOKEN || !GROQ_API_KEY) {
   console.error("❌ Missing required env vars. Check .env file.");
@@ -143,7 +144,17 @@ function timeAgo(d: string): string {
   return h < 1 ? "just now" : h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
 }
 
-function formatHN(stories: HNStory[], label: string): string {
+// Current HN front page (what's trending right now)
+async function fetchHNFront(limit = 5): Promise<HNStory[]> {
+  const res = await fetch(`https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=${limit}`);
+  if (!res.ok) throw new Error(`HN API ${res.status}`);
+  return ((await res.json()) as any).hits ?? [];
+}
+
+// Markets stories from the last 2 days
+const HN_MARKET_CFG = { queries: ["stock market", "inflation fed rates", "earnings", "IPO", "bitcoin", "economy"], minPoints: 10, days: 2 };
+
+function formatHN(stories: HNStory[], label: string, showTip = true): string {
   if (!stories.length) return `No HN stories found for *${label}* right now.`;
   const lines = [`🔥 *Top HN Stories — ${label}*\n`];
   stories.forEach((s, i) => {
@@ -153,7 +164,7 @@ function formatHN(stories: HNStory[], label: string): string {
     lines.push(s.url ? `📎 <${s.url}|Article>  |  🗣 <${hn}|HN Discussion>` : `🗣 <${hn}|HN Discussion>`);
     lines.push("");
   });
-  lines.push("_Tip: add a format tag to generate content from the top story — e.g. `#hn #crypto #thread`_");
+  if (showTip) lines.push("_Tip: add a format tag to generate content from the top story — e.g. `#hn #crypto #thread`_");
   return lines.join("\n");
 }
 
@@ -302,8 +313,9 @@ const lastAIResponse = new Map<string, string>(); // channelId → last response
 // ── Help message ──────────────────────────────────────────────────
 const HELP = `👋 *Mastiska — Your AI Second Brain*
 
-*📝 Quick Log*
-\`#note [text]\` → saves to Notes
+*📝 Quick Note*
+Just type anything (no tag) → saved to today's Notes file
+\`#note [text]\` → same thing, explicit
 \`#idea [text]\` → saves to Ideas/content-ideas
 \`#project [text]\` → saves to Ideas/project-ideas
 
@@ -342,6 +354,21 @@ _Evening check-in DM asks how many you finished._
 *Topic tags:* \`#ipo\` \`#earnings\` \`#rbi\` \`#crypto\` \`#nifty\` \`#budget\` \`#startup\` \`#forex\` \`#gold\` \`#fii\` \`#sector\` \`#economy\`
 *Format tags:* \`#thread\` \`#li\` \`#ig\` \`#yt\` \`#all\` \`#score\` \`#hook\` \`#ideas\` \`#explain\` \`#story\`
 *Trade tags:* \`#bull\` \`#bear\` \`#breakout\` \`#swing\` \`#intraday\` \`#longterm\` \`#fundamentals\` \`#technical\` \`#risk\``;
+
+// Slack wraps links as <url|label> and escapes & < > — turn that back into clean markdown
+function unslack(s: string): string {
+  return s
+    .replace(/<(https?:[^|>]+)\|([^>]+)>/g, "[$2]($1)")
+    .replace(/<(https?:[^>]+)>/g, "$1")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+// Quick capture: save any text to today's note file
+async function saveQuickNote(text: string, say: Function): Promise<void> {
+  const date = istDate();
+  const ok = await appendEntry(`Notes/${date}.md`, `# Daily Notes — ${date}\n`, `\n### ${istTime()}\n${unslack(text)}`);
+  await say(ok ? `📝 Saved to *Notes/${date}.md*` : SAVE_FAILED);
+}
 
 // ── Core message handler ──────────────────────────────────────────
 async function handleMessage(text: string, channelId: string, say: Function): Promise<void> {
@@ -410,10 +437,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   // ── #note ────────────────────────────────────────────────────────
   if (tags.includes("note")) {
     const content = clean.replace(/#\w+/g, "").trim();
-    if (!content) { await say("What do you want to note? Try `#note [your text]`"); return; }
-    const date = istDate();
-    const ok = await appendEntry(`Notes/${date}.md`, `# Daily Notes — ${date}\n`, `\n### ${istTime()}\n${content}`);
-    await say(ok ? `✅ Note saved to *Notes/${date}.md*` : SAVE_FAILED);
+    if (!content) { await say("What do you want to note? Just type it — no tag needed."); return; }
+    await saveQuickNote(content, say);
     return;
   }
 
@@ -534,7 +559,13 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   const parsed = parseTags(clean);
   const hasFintech = parsed.topicTags.length > 0 || parsed.tradeTags.length > 0 || parsed.hasFormat;
 
-  if (hasFintech || parsed.content) {
+  // No content-generation tags → it's a quick note. Just type a thought and it's saved.
+  if (!hasFintech) {
+    await saveQuickNote(clean, say);
+    return;
+  }
+
+  if (hasFintech) {
     const prompt = buildContentPrompt(parsed);
     await say("✍️ Working on it...");
     try {
@@ -585,7 +616,7 @@ async function runScheduler() {
   const now = toMin(istTime());
   // Due if within 2 hours after the target time and not yet sent today (survives short restarts)
   const due = (slot: string, at?: string) => {
-    if (!at) return false;
+    if (!at || at.toLowerCase() === "off") return false;
     const diff = now - toMin(at);
     return diff >= 0 && diff < 120 && !firedSlots.has(`${date}-${slot}`);
   };
@@ -596,6 +627,17 @@ async function runScheduler() {
     await dmOwner(tasks.length
       ? `☀️ *Good morning! Today's tasks*\n\n${formatTasks(tasks)}`
       : "☀️ Good morning! No tasks planned for today. Add some: `#todo #today task one; task two`");
+  }
+
+  if (due("hn", HN_DIGEST_TIME)) {
+    firedSlots.add(`${date}-hn`);
+    try {
+      const [tech, markets] = await Promise.all([fetchHNFront(5), fetchHNExtra(HN_MARKET_CFG, 5)]);
+      await dmOwner(`📰 *Your daily Hacker News digest*\n\n${formatHN(tech, "Tech (front page)", false)}\n${formatHN(markets, "Markets (last 2 days)", false)}`);
+    } catch (err) {
+      console.error("[Mastiska] HN digest error:", err);
+      await dmOwner("📰 Couldn't fetch the HN digest this morning. Try `#hn` in a bit.");
+    }
   }
 
   if (due("evening", EVENING_TIME)) {
@@ -622,7 +664,7 @@ createServer((_req, res) => { res.writeHead(200); res.end("Mastiska is running")
 
   if (OWNER_SLACK_ID) {
     setInterval(() => runScheduler().catch(e => console.error("[Mastiska] Scheduler error:", e)), 30_000);
-    console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
+    console.log(`⏰ Check-ins on: evening ${EVENING_TIME} IST, HN digest ${HN_DIGEST_TIME} IST${MORNING_TIME ? `, morning ${MORNING_TIME} IST` : ""}`);
   } else {
     console.log("ℹ️ OWNER_SLACK_ID not set — scheduled check-ins disabled.");
   }
