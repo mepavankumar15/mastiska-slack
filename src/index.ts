@@ -319,7 +319,20 @@ async function markDone(date: string, which: number[] | "all" | "none", undo = f
 const lastAIResponse = new Map<string, string>(); // channelId → last response
 
 // ── Help message ──────────────────────────────────────────────────
+// Muscle group tags for gym categorization
+const MUSCLE_GROUPS: Record<string, string> = {
+  chest: "Chest & Triceps", "chest&tricep": "Chest & Triceps", "chest&triceps": "Chest & Triceps",
+  back: "Back & Biceps", "back&bicep": "Back & Biceps", "back&biceps": "Back & Biceps",
+  legs: "Legs", leg: "Legs",
+  fullbody: "Full Body", full: "Full Body",
+  shoulders: "Shoulders", shoulder: "Shoulders",
+  arms: "Arms", arm: "Arms",
+  core: "Core", cardio: "Cardio",
+};
+
 const HELP = `👋 *Mastiska — Your AI Second Brain*
+
+Type \`#?\` or \`#help\` anytime to see this menu.
 
 *📝 Quick Note*
 Just type anything (no tag) → saved to today's Notes file
@@ -329,6 +342,9 @@ Just type anything (no tag) → saved to today's Notes file
 
 *🏋️ Gym*
 \`#gym [workout details]\` → today's workout log
+\`#gym #chest bench 80kg 4x8\` → log workout by muscle group
+_Muscle groups: \`#chest\` · \`#back\` · \`#legs\` · \`#fullbody\` · \`#shoulders\` · \`#arms\` · \`#core\` · \`#cardio\`_
+\`#gym show chest\` → view only chest workouts this week
 \`#gym #pr [lift] [weight]\` → logs a personal record
 \`#gym #weight [kg]\` → logs body weight
 \`#gym show\` / \`#gym yesterday\` / \`#gym week\` → view logs
@@ -736,8 +752,8 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   // Strip bot mention
   let clean = text.replace(/<@[A-Z0-9]+>/gi, "").trim();
 
-  // Empty → help
-  if (!clean) { await say(HELP); return; }
+  // Empty or help request → help
+  if (!clean || clean === "?" || clean === "#?") { await say(HELP); return; }
 
   // Short prefixes: "i: my idea" → "#idea my idea"
   const PREFIXES: Record<string, string> = {
@@ -750,6 +766,9 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
   const tags = clean.toLowerCase().match(/#\w+/g)?.map(t => t.slice(1)) ?? [];
   const cmd = tags[0]; // the new commands only trigger when they are the FIRST tag
   const arg = clean.replace(/#\w+/g, "").trim();
+
+  // ── #help / #? ────────────────────────────────────────────────────
+  if (cmd === "help" || cmd === "?" || clean === "#?") { await say(HELP); return; }
 
   // ── #save ────────────────────────────────────────────────────────
   if (tags.includes("save")) {
@@ -991,8 +1010,37 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
       return;
     }
 
-    // View logs: `#gym show`, `#gym yesterday`, `#gym week`, `#gym 2026-11-12`
-    const view = content.toLowerCase();
+    // Detect muscle group from tags
+    const muscleTag = tags.find(t => MUSCLE_GROUPS[t]);
+    const muscleLabel = muscleTag ? MUSCLE_GROUPS[muscleTag] : null;
+
+    // View logs: `#gym show`, `#gym yesterday`, `#gym week`, `#gym 2026-11-12`, `#gym show chest`
+    const viewRaw = content.toLowerCase();
+    // Check if viewing by muscle group: "show chest" or just "chest"
+    const muscleViewMatch = viewRaw.match(/^(?:show\s+)?([a-z&]+)$/) && MUSCLE_GROUPS[viewRaw.replace(/^show\s+/, "")];
+    const muscleFilter = muscleViewMatch ? MUSCLE_GROUPS[viewRaw.replace(/^show\s+/, "")] : null;
+
+    if (muscleFilter) {
+      // Show only workouts with this muscle group from the last 14 days
+      const days = [0, -1, -2, -3, -4, -5, -6, -7, -8, -9, -10, -11, -12, -13].map(o => istDate(o));
+      const parts: string[] = [];
+      for (const d of days) {
+        const f = await vaultRead(`Gym/${d}.md`);
+        if (!f) continue;
+        // Split by ### sections and find ones matching the muscle group
+        const sections = f.content.split(/(?=\n### )/);
+        const matching = sections.filter(s => s.includes(`[${muscleFilter}]`));
+        if (matching.length) parts.push(`*${d}*\n${matching.join("\n").trim()}`);
+      }
+      if (!parts.length) {
+        await say(`No *${muscleFilter}* workouts in the last 14 days. Log one with \`#gym #${muscleTag ?? muscleFilter.toLowerCase()} [exercises]\``);
+        return;
+      }
+      await say(`🏋️ *${muscleFilter} workouts — last 14 days*\n\n${parts.join("\n\n———\n\n")}`);
+      return;
+    }
+
+    const view = viewRaw;
     if (/^(show|today|yesterday|week|\d{4}-\d{2}-\d{2})$/.test(view)) {
       const days = view === "week" ? [0, -1, -2, -3, -4, -5, -6].map(o => istDate(o))
         : [view === "yesterday" ? istDate(-1) : /^\d/.test(view) ? view : istDate()];
@@ -1009,9 +1057,11 @@ async function handleMessage(text: string, channelId: string, say: Function): Pr
       return;
     }
 
-    // Regular workout log
-    const ok = await appendEntry(`Gym/${date}.md`, `# Workout — ${date}\n`, `\n### ${istTime()}\n${content || "Workout logged"}`);
-    await say(ok ? `💪 Workout logged to *Gym/${date}.md*` : SAVE_FAILED);
+    // Regular workout log — include muscle group label if provided
+    const musclePrefix = muscleLabel ? `[${muscleLabel}] ` : "";
+    const workoutContent = content.replace(new RegExp(`#${muscleTag}\\s*`, "i"), "").trim() || "Workout logged";
+    const ok = await appendEntry(`Gym/${date}.md`, `# Workout — ${date}\n`, `\n### ${istTime()}\n${musclePrefix}${workoutContent}`);
+    await say(ok ? `💪 Workout logged to *Gym/${date}.md*${muscleLabel ? ` · *${muscleLabel}*` : ""}` : SAVE_FAILED);
     return;
   }
 
